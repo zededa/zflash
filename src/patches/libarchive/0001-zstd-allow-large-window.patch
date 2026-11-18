@@ -1,0 +1,44 @@
+From 8510e0e6d8d9adf42e7da9b271810d0c305eac43 Mon Sep 17 00:00:00 2001
+From: Matthias Brod <matthias@zededa.com>
+Date: Wed, 18 Nov 2026 14:18:40 +0100
+Subject: [PATCH] zstd: allow large window sizes when decoding
+
+libzstd refuses to decode frames whose window exceeds 128 MiB
+(ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27) unless the decoder raises
+ZSTD_d_windowLogMax, and libarchive never does. Streams produced with
+`zstd --long=N` for N > 27 therefore fail with "Frame requires too much
+memory for decoding".
+
+EVE-OS release images are published as .zst files compressed with
+`zstd --long=30` (1 GiB window) to stay under GitHub's 2 GiB asset
+limit, so ZFlash cannot flash them without this change.
+
+Raise the limit to the maximum libzstd supports on the platform, the
+equivalent of `zstd -d --long=31` / `--memory=2048MB`. Memory is only
+allocated as large as the window each frame actually declares.
+---
+ libarchive/archive_read_support_filter_zstd.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libarchive/archive_read_support_filter_zstd.c b/libarchive/archive_read_support_filter_zstd.c
+index 9a1dd71..07fc2da 100644
+--- a/libarchive/archive_read_support_filter_zstd.c
++++ b/libarchive/archive_read_support_filter_zstd.c
+@@ -188,6 +188,14 @@ zstd_bidder_init(struct archive_read_filter *self)
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
++	/* Accept large windows, e.g. streams made with zstd --long=30 */
++	{
++		ZSTD_bounds wl = ZSTD_dParam_getBounds(ZSTD_d_windowLogMax);
++		if (!ZSTD_isError(wl.error))
++			ZSTD_DCtx_setParameter(dstream, ZSTD_d_windowLogMax,
++			    wl.upperBound);
++	}
++
+ 	self->data = state;
+ 
+ 	state->out_block_size = out_block_size;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -328,7 +328,9 @@ FetchContent_Declare(libarchive
     GIT_REPOSITORY https://github.com/libarchive/libarchive.git
     GIT_TAG v${LIBARCHIVE_VERSION}
     PATCH_COMMAND ${CMAKE_COMMAND} -P ${LIBARCHIVE_PATCH_FILE}
-          COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libarchive_zstd_window_patch.cmake
+          COMMAND ${CMAKE_COMMAND}
+                  -DPATCHES=${CMAKE_CURRENT_SOURCE_DIR}/patches/libarchive/0001-zstd-allow-large-window.patch
+                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patches.cmake
     ${USE_OVERRIDE_FIND_PACKAGE}
 )
 FetchContent_GetProperties(libarchive)

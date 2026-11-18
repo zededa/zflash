@@ -1,0 +1,3 @@
+# Keep patches byte-exact (no CRLF conversion on Windows checkouts),
+# otherwise `git apply` fails against the LF upstream sources.
+*.patch -text
