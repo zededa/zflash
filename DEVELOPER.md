@@ -62,6 +62,28 @@ Building ZFlash on Windows is best done with Visual Studio Code (or a derivative
 - In the CMake plugin tab, select the 'inno_installer' target, and build it
 - Your resultant installer will be located in `%WORKSPACE%\build\installer`
 
+Signing can be tuned with:
+
+- `-DIMAGER_SIGN_CERT_SHA1=<thumbprint>` - certificate in `Cert:\CurrentUser\My` to sign with (default: `signtool /a` picks one).
+- `-DIMAGER_SIGN_TIMESTAMP_URL=<url>` - RFC 3161 timestamp server (default: `http://timestamp.digicert.com`; empty disables timestamping).
+
+#### Self-signed builds
+
+For test/internal builds without a commercial certificate, run from a PowerShell prompt:
+
+```powershell
+.\build-win-selfsigned.ps1 -TrustLocally
+```
+
+It creates (or reuses) a self-signed code signing certificate in `Cert:\CurrentUser\My`, exports the
+public part to `certs\zflash-codesign.cer`, and builds the signed application and installer in
+`src\build-w64`. See `Get-Help .\build-win-selfsigned.ps1 -Full` for options (`-TimestampUrl ""` for
+offline builds, `-PfxFile` to use an existing certificate, `-SignOnly <files>` to just sign files).
+
+Windows only trusts the result on machines where `zflash-codesign.cer` has been imported into the
+`Trusted Root Certification Authorities` and `Trusted Publishers` stores. SmartScreen will still warn,
+since it relies on reputation that self-signed certificates do not have.
+
 ### macOS
 
 #### Get dependencies
