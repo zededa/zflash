@@ -43,6 +43,8 @@ set(Qt6_ROOT "/opt/Qt/6.9.0/gcc_arm64" CACHE PATH "Your Qt6 root path")
 if (WIN32)
     set(MINGW64_ROOT "" CACHE PATH "Your MinGW64 root path, likely provided by QtCreator")
     set(IMAGER_SIGNED_APP OFF CACHE BOOL "Sign Imager and its installer as part of the build. Requires a valid Code Signing certificate.")
+    set(IMAGER_SIGN_CERT_SHA1 "" CACHE STRING "SHA1 thumbprint of the code signing certificate (CurrentUser\\My store). Empty: let signtool pick the best one (/a).")
+    set(IMAGER_SIGN_TIMESTAMP_URL "http://timestamp.digicert.com" CACHE STRING "RFC 3161 timestamp server used when signing. Empty: do not timestamp.")
 endif()
 
 if (APPLE)
@@ -800,9 +802,22 @@ if (WIN32)
     endif()
     add_definitions(-DSIGNTOOL="${SIGNTOOL}")
 
+    # signtool arguments, shared by the post-build step and the installers
+    set(SIGNTOOL_ARGS sign /fd sha256)
+    if (IMAGER_SIGN_TIMESTAMP_URL)
+        list(APPEND SIGNTOOL_ARGS /tr ${IMAGER_SIGN_TIMESTAMP_URL} /td sha256)
+    endif()
+    if (IMAGER_SIGN_CERT_SHA1)
+        list(APPEND SIGNTOOL_ARGS /sha1 ${IMAGER_SIGN_CERT_SHA1})
+    else()
+        list(APPEND SIGNTOOL_ARGS /a)
+    endif()
+    list(JOIN SIGNTOOL_ARGS " " SIGNTOOL_ARGS_STR)
+    message(STATUS "Code signing command: ${SIGNTOOL} ${SIGNTOOL_ARGS_STR}")
+
     add_custom_command(TARGET ${PROJECT_NAME}
         POST_BUILD
-        COMMAND "${SIGNTOOL}" sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a "${CMAKE_BINARY_DIR}/${PROJECT_NAME}.exe")
+        COMMAND "${SIGNTOOL}" ${SIGNTOOL_ARGS} "${CMAKE_BINARY_DIR}/${PROJECT_NAME}.exe")
 
 
     endif(IMAGER_SIGNED_APP)
@@ -844,7 +859,7 @@ if (WIN32)
         if(INNO_COMPILER)
             if(IMAGER_SIGNED_APP)
                 add_custom_target(inno_installer
-                    COMMAND "${INNO_COMPILER}" "${CMAKE_CURRENT_BINARY_DIR}/rpi-imager.iss" "/DSIGNING_ENABLED" "/Ssign=${SIGNTOOL} sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $p"
+                    COMMAND "${INNO_COMPILER}" "${CMAKE_CURRENT_BINARY_DIR}/rpi-imager.iss" "/DSIGNING_ENABLED" "/Ssign=${SIGNTOOL} ${SIGNTOOL_ARGS_STR} $p"
                     DEPENDS ${PROJECT_NAME}
                     COMMENT "Building Inno Setup installer"
                     VERBATIM)
