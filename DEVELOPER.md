@@ -108,6 +108,17 @@ Building ZFlash on Windows is best done with Visual Studio Code (or a derivative
 - In the CMake plugin tab, select the 'zflash' target, and build it
 - Your resultant DMG will be located at `$WORKSPACE\build\ZFlash Imager-$VERSION.dmg`
 
+## Continuous integration and releases
+
+- `.github/workflows/build.yml` builds the Linux AppImage (x86_64), Windows installer (x64) and
+  macOS DMG (universal) for every pull request. The packages are attached to the workflow run as artifacts.
+- `.github/workflows/release.yml` is started manually (Actions → Release → Run workflow). It builds
+  the same packages, creates the GitHub release (tag defaults to `v<version>` from `src/CMakeLists.txt`,
+  created as a draft by default) and uploads the packages plus a `SHA256SUMS` file.
+- To sign the Windows binaries in a release, add the repository secrets `WINDOWS_SIGNING_PFX`
+  (the .pfx file, base64-encoded: `base64 -w0 sign.pfx`) and `WINDOWS_SIGNING_PFX_PASSWORD`, then
+  tick "Sign the Windows binaries" when running the workflow.
+
 ## Other notes
 
 ### Custom repository
