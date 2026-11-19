@@ -672,15 +672,15 @@ qt_add_translation(QM_FILES  ${TRANSLATIONS})
 configure_file(i18n/translations.qrc "${CMAKE_CURRENT_BINARY_DIR}" COPYONLY)
 set(SOURCES ${SOURCES} ${CMAKE_CURRENT_BINARY_DIR}/translations.qrc ${QM_FILES})
 
-# Create an rpi-imager_lupdate target
-qt_add_lupdate(TS_FILES ${TRANSLATIONS} SOURCE_TARGETS ${PROJECT_NAME} OPTIONS -no-obsolete -locations none)
-
 if (WIN32)
     # Adding WIN32 prevents a console window being opened on Windows
     add_executable(${PROJECT_NAME} WIN32 ${SOURCES} ${HEADERS} ${DEPENDENCIES})
 else()
     add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${DEPENDENCIES})
 endif()
+
+# Create a zflash_lupdate target (must come after the target exists)
+qt_add_lupdate(TS_FILES ${TRANSLATIONS} SOURCE_TARGETS ${PROJECT_NAME} OPTIONS -no-obsolete -locations none)
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY AUTOMOC ON)
 set_property(TARGET ${PROJECT_NAME} PROPERTY AUTORCC ON)
