@@ -16,6 +16,13 @@ on:
         description: Sign the Windows and macOS packages (zflash-release environment)
         type: boolean
         default: false
+    outputs:
+      macos-notarization:
+        description: "notarized, pending (Apple still reviewing) or unsigned"
+        value: ${{ jobs.macos.outputs.notarization }}
+      macos-submission:
+        description: Apple notary submission ID of the macOS DMG
+        value: ${{ jobs.macos.outputs.submission }}
 
 permissions:
   contents: read
@@ -238,8 +245,15 @@ jobs:
     name: macOS (universal DMG)
     runs-on: macos-latest
     environment: ${{ inputs.sign && 'zflash-release' || '' }}
+    outputs:
+      notarization: ${{ steps.notary.outputs.status || 'unsigned' }}
+      submission: ${{ steps.notary.outputs.submission }}
     env:
       SIGN: ${{ inputs.sign && 'true' || 'false' }}
+      # How long the job waits for Apple. A new app can be held for
+      # "in-depth analysis" for hours or days; the release then stays a draft
+      # and the "Finish macOS notarization" workflow completes it later.
+      NOTARY_WAIT: 20m
     steps:
       - uses: actions/checkout@v7
 
@@ -301,7 +315,8 @@ jobs:
           mv "build/ZFlash Imager-${ver}.dmg" "dist/ZFlash-${ver}-macos-universal.dmg"
           ls -l dist
 
-      - name: Notarize and staple
+      - name: Notarize
+        id: notary
         if: inputs.sign
         env:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
@@ -315,36 +330,60 @@ jobs:
           key="$RUNNER_TEMP/zflash-notary.p8"
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
-          dmg=$(ls dist/*.dmg)
           auth=(--key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
-          xcrun notarytool submit "$dmg" "${auth[@]}" --wait --timeout 1h --output-format json | tee notary.json
-          id=$(python3 -c 'import json;print(json.load(open("notary.json"))["id"])')
-          status=$(python3 -c 'import json;print(json.load(open("notary.json"))["status"])')
-          if [ "$status" != "Accepted" ]; then
-            xcrun notarytool log "$id" "${auth[@]}" || true
-            echo "::error::Notarization ended with status $status"
-            exit 1
-          fi
-          xcrun stapler staple "$dmg"
+          dmg=$(ls dist/*.dmg)
+          field() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$@"; }
+
+          xcrun notarytool submit "$dmg" "${auth[@]}" --output-format json > submit.json
+          id=$(field submit.json id)
+          echo "Submitted to Apple: $id"
+          echo "submission=$id" >> "$GITHUB_OUTPUT"
+
+          # Waits at most NOTARY_WAIT; Apple keeps reviewing after a timeout.
+          xcrun notarytool wait "$id" "${auth[@]}" --timeout "$NOTARY_WAIT" || true
+          xcrun notarytool info "$id" "${auth[@]}" --output-format json > info.json
+          status=$(field info.json status)
+          echo "Apple status: $status"
+          case "$status" in
+            Accepted)
+              xcrun stapler staple "$dmg"
+              echo "status=notarized" >> "$GITHUB_OUTPUT"
+              ;;
+            "In Progress")
+              echo "::warning::Apple is still reviewing the DMG (submission $id). The release stays a draft; run the 'Finish macOS notarization' workflow later."
+              echo "status=pending" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              xcrun notarytool log "$id" "${auth[@]}" || true
+              echo "::error::Notarization ended with status $status"
+              exit 1
+              ;;
+          esac
 
       - name: Check the signatures
         if: inputs.sign
         env:
           IDENTITY: ${{ steps.cert.outputs.identity }}
+          NOTARIZATION: ${{ steps.notary.outputs.status }}
         run: |
           set -euo pipefail
           dmg=$(ls dist/*.dmg)
           codesign --verify --strict --verbose=2 "$dmg"
           codesign -dvv "$dmg" 2>&1 | grep -qF "Authority=$IDENTITY" || { echo "::error::DMG is not signed by $IDENTITY"; exit 1; }
-          xcrun stapler validate "$dmg"
-          spctl --assess --type open --context context:primary-signature -vv "$dmg"
           mnt=$(mktemp -d)
           hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mnt" "$dmg" >/dev/null
           trap 'hdiutil detach "$mnt" >/dev/null || true' EXIT
           app=$(ls -d "$mnt"/*.app)
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -dvv "$app" 2>&1 | grep -qF "Authority=$IDENTITY" || { echo "::error::App is not signed by $IDENTITY"; exit 1; }
-          spctl --assess --type execute -vv "$app"
+          # Gatekeeper accepts the DMG only once it is notarized.
+          if [ "$NOTARIZATION" = "notarized" ]; then
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --context context:primary-signature -vv "$dmg"
+            spctl --assess --type execute -vv "$app"
+          else
+            echo "Notarization pending: the Gatekeeper checks run in 'Finish macOS notarization'."
+          fi
 
       - name: Remove the signing keychain
         if: always() && steps.cert.outputs.keychain
