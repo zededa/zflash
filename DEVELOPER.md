@@ -125,7 +125,16 @@ Building ZFlash on Windows is best done with Visual Studio Code (or a derivative
     takes the same setup through `-DSIGNTOOL`, `-DIMAGER_SIGN_DLIB` and `-DIMAGER_SIGN_DLIB_METADATA`.
   - macOS: the app and the DMG are signed with the Developer ID of Zededa Germany GmbH, then the DMG
     is notarized by Apple and the ticket stapled. The environment secrets `CSC_LINK` (base64 `.p12`),
-    `CSC_KEY_PASSWORD`, `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` configure it.
+    `CSC_KEY_PASSWORD`, `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` configure it
+    (the API key is "ZFlash CI" in App Store Connect).
+  - Apple sometimes holds a submission for "in-depth analysis" for hours or days, mostly for new apps.
+    The Release workflow waits 20 minutes; if Apple has not answered by then, it still creates the
+    release as a **draft** with the signed but not yet notarized DMG and a note naming the Apple
+    submission. Later, run Actions → **Finish macOS notarization** with the release tag: if Apple has
+    accepted the submission it staples the DMG, checks it with Gatekeeper, replaces it and its
+    `SHA256SUMS` line in the draft and removes the note; if Apple is still reviewing it, it says so and
+    stops, so it can simply be run again. Do not publish a release while the note is there, and do not
+    re-run the Release workflow just to retry: a new upload queues behind the held one.
   - Both jobs end with a check that fails the release unless the signatures are valid and from
     the expected signer.
 - Pull request builds are never signed.

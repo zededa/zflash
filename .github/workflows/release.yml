@@ -98,14 +98,29 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           DRAFT: ${{ inputs.draft }}
           PRERELEASE: ${{ inputs.prerelease }}
+          NOTARIZATION: ${{ needs.build.outputs.macos-notarization }}
+          SUBMISSION: ${{ needs.build.outputs.macos-submission }}
         run: |
           flags=()
+          notes=""
           [ "$DRAFT" = "true" ] && flags+=(--draft)
           [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          if [ "$NOTARIZATION" = "pending" ]; then
+            # The DMG is signed but Apple has not finished notarizing it, so
+            # Gatekeeper would still block it: never publish it like this.
+            [ "$DRAFT" = "true" ] || echo "::warning::Created as a draft: Apple is still notarizing the macOS DMG."
+            [ "$DRAFT" = "true" ] || flags+=(--draft)
+            notes=$(printf '%s\n' \
+              "<!-- zflash-notarization-pending: $SUBMISSION -->" \
+              "> [!WARNING]" \
+              "> Apple is still notarizing the macOS DMG (submission \`$SUBMISSION\`). Run the **Finish macOS notarization** workflow with tag \`$TAG\` before publishing; it staples the DMG and removes this note." \
+              "<!-- /zflash-notarization-pending -->" "")
+          fi
           # Creates the tag on the built commit if it does not exist yet.
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "ZFlash $VERSION" \
+            --notes "$notes" \
             --generate-notes \
             "${flags[@]}"

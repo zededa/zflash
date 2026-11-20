@@ -1,0 +1,152 @@
+name: Finish macOS notarization
+
+# Manually triggered. Completes a release whose macOS DMG Apple was still
+# notarizing when the Release workflow ended (Apple can hold a new app for
+# "in-depth analysis" for hours or days).
+#
+# Asks Apple about the submission recorded in the draft release:
+#   - still in progress: says so and stops (run it again later);
+#   - accepted: staples the ticket to the DMG, checks it with Gatekeeper,
+#     replaces the DMG and its SHA256SUMS line in the release, and removes
+#     the pending note. The release stays a draft until someone publishes it;
+#   - rejected: prints Apple's log and fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v1.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finish-notarization-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  finish:
+    name: Finish macOS notarization
+    runs-on: macos-latest
+    environment: zflash-release
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Find the pending submission
+        id: release
+        run: |
+          set -euo pipefail
+          # Drafts have no tag yet, so look the release up by its tag name.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\")" > release.json
+          [ -s release.json ] || { echo "::error::No release with tag $TAG"; exit 1; }
+          python3 - <<'PY'
+          import json, os, re
+          r = json.load(open("release.json"))
+          m = re.search(r"<!-- zflash-notarization-pending: ([0-9a-f-]{36}) -->", r.get("body") or "")
+          dmgs = [a for a in r["assets"] if a["name"].endswith("-macos-universal.dmg")]
+          sums = [a for a in r["assets"] if a["name"] == "SHA256SUMS"]
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          out.write(f"id={r['id']}\n")
+          out.write(f"submission={m.group(1) if m else ''}\n")
+          if m:
+              if len(dmgs) != 1 or len(sums) != 1:
+                  raise SystemExit("::error::Expected one macOS DMG and one SHA256SUMS in the release")
+              out.write(f"dmg_name={dmgs[0]['name']}\ndmg_asset={dmgs[0]['id']}\nsums_asset={sums[0]['id']}\n")
+          PY
+          if [ -z "$(grep '^submission=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)" ]; then
+            echo "Release $TAG has no pending macOS notarization. Nothing to do."
+          fi
+
+      - name: Ask Apple
+        id: apple
+        if: steps.release.outputs.submission != ''
+        env:
+          SUBMISSION: ${{ steps.release.outputs.submission }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/zflash-notary.p8"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          auth=(--key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
+          xcrun notarytool info "$SUBMISSION" "${auth[@]}" --output-format json > info.json
+          status=$(python3 -c 'import json;print(json.load(open("info.json"))["status"])')
+          echo "Apple status of $SUBMISSION: $status"
+          case "$status" in
+            Accepted) echo "accepted=true" >> "$GITHUB_OUTPUT" ;;
+            "In Progress")
+              echo "::notice::Apple is still reviewing submission $SUBMISSION. Run this workflow again later."
+              ;;
+            *)
+              xcrun notarytool log "$SUBMISSION" "${auth[@]}" || true
+              echo "::error::Notarization ended with status $status"
+              exit 1
+              ;;
+          esac
+
+      - name: Staple and check the DMG
+        if: steps.apple.outputs.accepted == 'true'
+        env:
+          DMG_NAME: ${{ steps.release.outputs.dmg_name }}
+          DMG_ASSET: ${{ steps.release.outputs.dmg_asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          dmg="dist/$DMG_NAME"
+          gh api -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$DMG_ASSET" > "$dmg"
+          # Fails unless Apple's ticket matches this exact file.
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          spctl --assess --type open --context context:primary-signature -vv "$dmg"
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mnt" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mnt" >/dev/null || true' EXIT
+          app=$(ls -d "$mnt"/*.app)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute -vv "$app"
+
+      - name: Update the release
+        if: steps.apple.outputs.accepted == 'true'
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          DMG_NAME: ${{ steps.release.outputs.dmg_name }}
+          DMG_ASSET: ${{ steps.release.outputs.dmg_asset }}
+          SUMS_ASSET: ${{ steps.release.outputs.sums_asset }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          upload() {  # name, file, content type
+            gh api -X POST -H "Content-Type: $3" --input "$2" \
+              "https://uploads.github.com/repos/$repo/releases/$RELEASE_ID/assets?name=$1" >/dev/null
+          }
+          # SHA256SUMS: replace the DMG's line (stapling changed the file).
+          gh api -H "Accept: application/octet-stream" "repos/$repo/releases/assets/$SUMS_ASSET" > SHA256SUMS
+          new=$(cd dist && shasum -a 256 "$DMG_NAME")
+          grep -vF "  $DMG_NAME" SHA256SUMS > SHA256SUMS.new || true
+          echo "$new" >> SHA256SUMS.new
+          sort -k2 SHA256SUMS.new > SHA256SUMS
+          cat SHA256SUMS
+
+          gh api -X DELETE "repos/$repo/releases/assets/$DMG_ASSET"
+          upload "$DMG_NAME" "dist/$DMG_NAME" application/x-apple-diskimage
+          gh api -X DELETE "repos/$repo/releases/assets/$SUMS_ASSET"
+          upload SHA256SUMS SHA256SUMS text/plain
+
+          # Remove the pending note from the release notes.
+          python3 - <<'PY'
+          import json, re
+          body = json.load(open("release.json")).get("body") or ""
+          body = re.sub(r"<!-- zflash-notarization-pending: .*?<!-- /zflash-notarization-pending -->\n*", "", body, flags=re.S)
+          json.dump({"body": body}, open("patch.json", "w"))
+          PY
+          gh api -X PATCH "repos/$repo/releases/$RELEASE_ID" --input patch.json >/dev/null
+          echo "::notice::The macOS DMG of $TAG is notarized and stapled. The release is still a draft: publish it when ready."
