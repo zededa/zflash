@@ -6,11 +6,11 @@
 set -e
 
 # Configuration  
-APP_NAME="Raspberry Pi Imager"
+APP_NAME="@APP_NAME@"
 PROJECT_NAME="@CMAKE_PROJECT_NAME@"
 SOURCE_APP_PATH="@CMAKE_BINARY_DIR@/${PROJECT_NAME}.app"
 DMG_APP_PATH="@CMAKE_BINARY_DIR@/${APP_NAME}.app"
-FINAL_DMG_PATH="@CMAKE_BINARY_DIR@/${PROJECT_NAME}-@IMAGER_VERSION_STR@.dmg"
+FINAL_DMG_PATH="@FINAL_DMG_PATH@"
 DMG_BACKGROUND_PATH="@CMAKE_BINARY_DIR@/dmg_background.png"
 SIGNING_IDENTITY="@IMAGER_SIGNING_IDENTITY@"
 SHOULD_NOTARIZE="@IMAGER_NOTARIZE_APP@"
@@ -80,34 +80,26 @@ if [ -n "$SIGNING_IDENTITY" ] && [ "$SIGNING_IDENTITY" != "NONE" ] && [ "$SIGNIN
     echo "Signing the deployed app bundle..."
     echo "Signing identity: $SIGNING_IDENTITY"
     
-    # Sign all the frameworks first
-    find "$DMG_APP_PATH" -name "*.framework" -type d | while read framework; do
-        echo "Signing framework: $framework"
-        codesign --force --verify --verbose --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$framework" || {
-            echo "Warning: Failed to sign framework $framework"
-        }
-    done
-    
-    # Sign all dylibs
-    find "$DMG_APP_PATH" -name "*.dylib" -type f | while read dylib; do
-        echo "Signing dylib: $dylib"
-        codesign --force --verify --verbose --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$dylib" || {
-            echo "Warning: Failed to sign dylib $dylib"
-        }
-    done
-    
-    # Sign the main app bundle
-    echo "Signing main app bundle: $DMG_APP_PATH"
-    
-    # Sign without entitlements to avoid provisioning profile requirements
-    echo "Signing without entitlements to avoid taskgated provisioning profile issues"
-    CODESIGN_CMD=(codesign --force --verify --verbose --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$DMG_APP_PATH")
-    
-    "${CODESIGN_CMD[@]}" || {
-        echo "Error: Failed to sign main app bundle"
-        exit 1
+    # Sign from the inside out, so each bundle is sealed after its contents:
+    # loose dylibs and plug-ins first, then the frameworks, then the app.
+    # Any failure stops the build; an app with an unsigned part cannot be notarized.
+    sign() {
+        codesign --force --verbose --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$1"
     }
-    
+    while IFS= read -r -d '' dylib; do
+        echo "Signing dylib: $dylib"
+        sign "$dylib"
+    done < <(find "$DMG_APP_PATH" -name "*.dylib" -type f -not -path "*.framework/*" -print0)
+
+    while IFS= read -r -d '' framework; do
+        echo "Signing framework: $framework"
+        sign "$framework"
+    done < <(find "$DMG_APP_PATH" -name "*.framework" -type d -print0)
+
+    echo "Signing main app bundle: $DMG_APP_PATH"
+    sign "$DMG_APP_PATH"
+    codesign --verify --deep --strict --verbose=2 "$DMG_APP_PATH"
+
     echo "✓ App bundle signed successfully"
 else
     echo "No signing identity provided, skipping app bundle signing"
@@ -129,7 +121,7 @@ echo "Creating DMG with create-dmg..."
 # Build create-dmg command
 CREATE_DMG_CMD=(
     create-dmg
-    --volname "Raspberry Pi Imager"
+    --volname "${APP_NAME}"
     --window-pos 200 120
     --window-size 600 400
     --icon-size 128
@@ -145,8 +137,10 @@ else
     echo "No custom background image found, using default"
 fi
 
-# Note: We don't add --codesign to create-dmg since we've already signed the app bundle
-# create-dmg will sign the DMG itself, but the app bundle is already properly signed
+# Sign the disk image itself too; Gatekeeper checks it before mounting.
+if [ -n "$SIGNING_IDENTITY" ] && [ "$SIGNING_IDENTITY" != "NONE" ]; then
+    CREATE_DMG_CMD+=(--codesign "$SIGNING_IDENTITY")
+fi
 
 # Add notarization if requested
 if [ "$SHOULD_NOTARIZE" = "ON" ] && [ -n "$KEYCHAIN_PROFILE" ] && [ "$KEYCHAIN_PROFILE" != "" ]; then
