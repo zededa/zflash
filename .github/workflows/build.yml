@@ -2,22 +2,20 @@ name: Build
 
 # Builds ZFlash for Linux (AppImage), Windows (installer) and macOS (DMG).
 # Runs on every pull request, and is reused by the release workflow.
+#
+# With sign: true the Windows and macOS jobs run in the zflash-release
+# environment (which needs an approval) and sign with ZEDEDA's certificates:
+# Windows through Azure Artifact Signing, macOS with the Developer ID and
+# Apple notarization. Pull request builds are never signed.
 
 on:
   pull_request:
   workflow_call:
     inputs:
-      sign-windows:
-        description: Sign the Windows binaries (needs the WINDOWS_SIGNING_PFX secrets)
+      sign:
+        description: Sign the Windows and macOS packages (zflash-release environment)
         type: boolean
         default: false
-    secrets:
-      WINDOWS_SIGNING_PFX:
-        description: Base64-encoded .pfx code signing certificate
-        required: false
-      WINDOWS_SIGNING_PFX_PASSWORD:
-        description: Password of the .pfx
-        required: false
 
 permissions:
   contents: read
@@ -82,6 +80,16 @@ jobs:
   windows:
     name: Windows (x64 installer)
     runs-on: windows-2022
+    environment: ${{ inputs.sign && 'zflash-release' || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SIGN: ${{ inputs.sign && 'true' || 'false' }}
+      # Pinned versions of the Azure signing client and of a signtool new
+      # enough to load it (needs Windows SDK 10.0.22621.755 or later).
+      ARTIFACT_SIGNING_CLIENT_VERSION: "1.0.151"
+      SDK_BUILD_TOOLS_VERSION: "10.0.28000.2957"
     steps:
       - uses: actions/checkout@v7
 
@@ -102,29 +110,68 @@ jobs:
             choco install innosetup --no-progress -y
           }
 
-      - name: Import signing certificate
-        id: cert
-        if: inputs.sign-windows
+      - name: Sign in to Azure
+        if: inputs.sign
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Prepare Azure Artifact Signing
+        id: signing
+        if: inputs.sign
         shell: pwsh
         env:
-          PFX_B64: ${{ secrets.WINDOWS_SIGNING_PFX }}
-          PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          AZURE_SIGN_ENDPOINT: ${{ vars.AZURE_SIGN_ENDPOINT }}
+          AZURE_SIGN_ACCOUNT: ${{ vars.AZURE_SIGN_ACCOUNT }}
+          AZURE_SIGN_PROFILE: ${{ vars.AZURE_SIGN_PROFILE }}
         run: |
-          if (-not $env:PFX_B64) { throw "sign-windows requested but the WINDOWS_SIGNING_PFX secret is not set" }
-          $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
-          $pw = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
-          $cert = Import-PfxCertificate -FilePath $pfx -Password $pw -CertStoreLocation Cert:\CurrentUser\My |
-                  Where-Object { $_.HasPrivateKey } | Select-Object -First 1
-          Remove-Item $pfx
-          if (-not $cert) { throw "No certificate with a private key found in WINDOWS_SIGNING_PFX" }
-          Write-Host "Signing with $($cert.Subject) ($($cert.Thumbprint))"
-          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'AZURE_SIGN_ENDPOINT','AZURE_SIGN_ACCOUNT','AZURE_SIGN_PROFILE') {
+            if (-not (Get-Item "env:$name").Value) { throw "$name is not set on the zflash-release environment" }
+          }
+          # Inno Setup passes the signing command line unquoted: keep these paths free of spaces.
+          $tools = Join-Path $env:RUNNER_TEMP 'signing'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          function Get-Package($id, $version) {
+            $dir = Join-Path $tools $id
+            $pkg = "$dir.zip"
+            Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/$($id.ToLower())/$version/$($id.ToLower()).$version.nupkg" -OutFile $pkg
+            Expand-Archive -Path $pkg -DestinationPath $dir -Force
+            Remove-Item $pkg
+            return $dir
+          }
+          $client = Get-Package 'Microsoft.ArtifactSigning.Client' $env:ARTIFACT_SIGNING_CLIENT_VERSION
+          $sdk = Get-Package 'Microsoft.Windows.SDK.BuildTools' $env:SDK_BUILD_TOOLS_VERSION
+          $dlib = Join-Path $client 'bin\x64\Azure.CodeSigning.Dlib.dll'
+          $signtool = Get-ChildItem -Path (Join-Path $sdk 'bin') -Recurse -Filter signtool.exe |
+                      Where-Object { $_.Directory.Name -eq 'x64' } | Select-Object -First 1
+          if (-not (Test-Path $dlib)) { throw "Azure.CodeSigning.Dlib.dll not found in the signing client package" }
+          if (-not $signtool) { throw "signtool.exe not found in the SDK build tools package" }
+          # Only the Azure CLI sign-in from the previous step is used.
+          $metadata = Join-Path $tools 'metadata.json'
+          @{
+            Endpoint               = $env:AZURE_SIGN_ENDPOINT
+            CodeSigningAccountName = $env:AZURE_SIGN_ACCOUNT
+            CertificateProfileName = $env:AZURE_SIGN_PROFILE
+            ExcludeCredentials     = @(
+              'EnvironmentCredential', 'WorkloadIdentityCredential', 'ManagedIdentityCredential',
+              'SharedTokenCacheCredential', 'VisualStudioCredential', 'VisualStudioCodeCredential',
+              'AzurePowerShellCredential', 'AzureDeveloperCliCredential', 'InteractiveBrowserCredential'
+            )
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8
+          Write-Host "signtool: $($signtool.FullName)"
+          "signtool=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+          "dlib=$dlib" >> $env:GITHUB_OUTPUT
+          "metadata=$metadata" >> $env:GITHUB_OUTPUT
 
       - name: Build installer
         shell: pwsh
         env:
-          THUMBPRINT: ${{ steps.cert.outputs.thumbprint }}
+          SIGNTOOL: ${{ steps.signing.outputs.signtool }}
+          SIGN_DLIB: ${{ steps.signing.outputs.dlib }}
+          SIGN_METADATA: ${{ steps.signing.outputs.metadata }}
         run: |
           $mingw = Join-Path $env:RUNNER_WORKSPACE "Qt\Tools\mingw1310_64"
           if (-not (Test-Path "$mingw\bin\g++.exe")) { throw "MinGW not found at $mingw" }
@@ -140,8 +187,14 @@ jobs:
             "-DMINGW64_ROOT=$mingw",
             "-DENABLE_INNO_INSTALLER=ON"
           )
-          if ($env:THUMBPRINT) {
-            $cmakeArgs += @("-DIMAGER_SIGNED_APP=ON", "-DIMAGER_SIGN_CERT_SHA1=$env:THUMBPRINT")
+          if ($env:SIGN -eq 'true') {
+            $cmakeArgs += @(
+              "-DIMAGER_SIGNED_APP=ON",
+              "-DSIGNTOOL=$env:SIGNTOOL",
+              "-DIMAGER_SIGN_DLIB=$env:SIGN_DLIB",
+              "-DIMAGER_SIGN_DLIB_METADATA=$env:SIGN_METADATA",
+              "-DIMAGER_SIGN_TIMESTAMP_URL=http://timestamp.acs.microsoft.com"
+            )
           }
           cmake @cmakeArgs
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
@@ -156,6 +209,24 @@ jobs:
           mv build/installer/imager-*.exe "dist/ZFlash-${ver}-windows-x64-setup.exe"
           ls -l dist
 
+      - name: Check the signatures
+        if: inputs.sign
+        shell: powershell
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:EXPECTED_PUBLISHER) { throw "WINDOWS_PUBLISHER is not set on the zflash-release environment" }
+          $files = @(Get-ChildItem dist -Filter '*-setup.exe') + @(Get-Item build\deploy\zflash.exe)
+          $failed = 0
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $file.FullName
+            $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '(none)' }
+            Write-Host "$($file.Name): $($sig.Status), signer: $subject, timestamped: $([bool]$sig.TimeStamperCertificate)"
+            if ($sig.Status -ne 'Valid' -or $subject -ne $env:EXPECTED_PUBLISHER -or -not $sig.TimeStamperCertificate) { $failed++ }
+          }
+          if ($failed) { throw "$failed file(s) failed the signature check" }
+
       - uses: actions/upload-artifact@v7
         with:
           name: zflash-windows-x64
@@ -166,6 +237,9 @@ jobs:
   macos:
     name: macOS (universal DMG)
     runs-on: macos-latest
+    environment: ${{ inputs.sign && 'zflash-release' || '' }}
+    env:
+      SIGN: ${{ inputs.sign && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -178,9 +252,45 @@ jobs:
           arch: clang_64
           cache: true
 
-      - name: Build DMG
+      - name: Import the Developer ID certificate
+        id: cert
+        if: inputs.sign
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
         run: |
-          cmake -S src -B build -DCMAKE_BUILD_TYPE=MinSizeRel -DQt6_ROOT="$QT_ROOT_DIR"
+          set -euo pipefail
+          for name in CSC_LINK CSC_KEY_PASSWORD; do
+            [ -n "${!name}" ] || { echo "::error::$name is not set on the zflash-release environment"; exit 1; }
+          done
+          brew install create-dmg
+          # A keychain of this job's own, removed in the last step.
+          kc="$RUNNER_TEMP/zflash-signing.keychain-db"
+          kcpw=$(openssl rand -hex 24)
+          p12="$RUNNER_TEMP/zflash-signing.p12"
+          trap 'rm -f "$p12"' EXIT
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          printf '%s' "$CSC_LINK" | base64 --decode > "$p12"
+          security import "$p12" -k "$kc" -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$kc" | sed -nE 's/.*"(Developer ID Application: [^"]+)".*/\1/p' | head -1)
+          [ -n "$identity" ] || { echo "::error::No Developer ID Application identity in CSC_LINK"; exit 1; }
+          echo "Signing as: $identity"
+          echo "keychain=$kc" >> "$GITHUB_OUTPUT"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+
+      - name: Build DMG
+        env:
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: |
+          args=(-S src -B build -DCMAKE_BUILD_TYPE=MinSizeRel -DQt6_ROOT="$QT_ROOT_DIR")
+          if [ "$SIGN" = "true" ]; then
+            args+=(-DIMAGER_SIGNED_APP=ON -DIMAGER_SIGNING_IDENTITY="$IDENTITY")
+          fi
+          cmake "${args[@]}"
           cmake --build build -j "$(sysctl -n hw.ncpu)"
           cmake --build build --target dmg
 
@@ -190,6 +300,57 @@ jobs:
           mkdir -p dist
           mv "build/ZFlash Imager-${ver}.dmg" "dist/ZFlash-${ver}-macos-universal.dmg"
           ls -l dist
+
+      - name: Notarize and staple
+        if: inputs.sign
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            [ -n "${!name}" ] || { echo "::error::$name is not set on the zflash-release environment"; exit 1; }
+          done
+          key="$RUNNER_TEMP/zflash-notary.p8"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          dmg=$(ls dist/*.dmg)
+          auth=(--key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
+          xcrun notarytool submit "$dmg" "${auth[@]}" --wait --timeout 1h --output-format json | tee notary.json
+          id=$(python3 -c 'import json;print(json.load(open("notary.json"))["id"])')
+          status=$(python3 -c 'import json;print(json.load(open("notary.json"))["status"])')
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$id" "${auth[@]}" || true
+            echo "::error::Notarization ended with status $status"
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+
+      - name: Check the signatures
+        if: inputs.sign
+        env:
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          dmg=$(ls dist/*.dmg)
+          codesign --verify --strict --verbose=2 "$dmg"
+          codesign -dvv "$dmg" 2>&1 | grep -qF "Authority=$IDENTITY" || { echo "::error::DMG is not signed by $IDENTITY"; exit 1; }
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -vv "$dmg"
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mnt" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mnt" >/dev/null || true' EXIT
+          app=$(ls -d "$mnt"/*.app)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvv "$app" 2>&1 | grep -qF "Authority=$IDENTITY" || { echo "::error::App is not signed by $IDENTITY"; exit 1; }
+          spctl --assess --type execute -vv "$app"
+
+      - name: Remove the signing keychain
+        if: always() && steps.cert.outputs.keychain
+        env:
+          KEYCHAIN: ${{ steps.cert.outputs.keychain }}
+        run: security delete-keychain "$KEYCHAIN" || true
 
       - uses: actions/upload-artifact@v7
         with:

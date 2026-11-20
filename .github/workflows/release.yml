@@ -1,7 +1,10 @@
 name: Release
 
 # Manually triggered: builds ZFlash for Linux, Windows and macOS, creates the
-# GitHub release and uploads the packages to it.
+# GitHub release and uploads the packages to it. By default the Windows
+# installer is signed through Azure Artifact Signing and the macOS DMG is
+# signed with ZEDEDA's Developer ID and notarized; both jobs wait for an
+# approval of the zflash-release environment.
 
 on:
   workflow_dispatch:
@@ -18,10 +21,10 @@ on:
         description: Mark the release as a pre-release
         type: boolean
         default: false
-      sign-windows:
-        description: Sign the Windows binaries (needs the WINDOWS_SIGNING_PFX secrets)
+      sign:
+        description: Sign the Windows and macOS packages (needs approval of the zflash-release environment)
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -59,9 +62,13 @@ jobs:
   build:
     name: Build
     needs: prepare
+    permissions:
+      contents: read
+      # Lets the Windows job sign in to Azure Artifact Signing with OIDC.
+      id-token: write
     uses: ./.github/workflows/build.yml
     with:
-      sign-windows: ${{ inputs.sign-windows }}
+      sign: ${{ inputs.sign }}
     secrets: inherit
 
   release:

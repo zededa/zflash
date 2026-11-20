@@ -115,9 +115,20 @@ Building ZFlash on Windows is best done with Visual Studio Code (or a derivative
 - `.github/workflows/release.yml` is started manually (Actions → Release → Run workflow). It builds
   the same packages, creates the GitHub release (tag defaults to `v<version>` from `src/CMakeLists.txt`,
   created as a draft by default) and uploads the packages plus a `SHA256SUMS` file.
-- To sign the Windows binaries in a release, add the repository secrets `WINDOWS_SIGNING_PFX`
-  (the .pfx file, base64-encoded: `base64 -w0 sign.pfx`) and `WINDOWS_SIGNING_PFX_PASSWORD`, then
-  tick "Sign the Windows binaries" when running the workflow.
+- Releases are signed by default ("Sign the Windows and macOS packages" in the Run workflow form).
+  The Windows and macOS jobs then run in the `zflash-release` environment, which waits for an
+  approval and is limited to the `zflash` branch:
+  - Windows: the app, the installer and its uninstaller are signed by **Zededa Germany GmbH** through
+    Azure Artifact Signing. The job signs in to Azure with GitHub OIDC (no stored password); the
+    environment variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SIGN_ENDPOINT`,
+    `AZURE_SIGN_ACCOUNT`, `AZURE_SIGN_PROFILE` and `WINDOWS_PUBLISHER` configure it. Locally, CMake
+    takes the same setup through `-DSIGNTOOL`, `-DIMAGER_SIGN_DLIB` and `-DIMAGER_SIGN_DLIB_METADATA`.
+  - macOS: the app and the DMG are signed with the Developer ID of Zededa Germany GmbH, then the DMG
+    is notarized by Apple and the ticket stapled. The environment secrets `CSC_LINK` (base64 `.p12`),
+    `CSC_KEY_PASSWORD`, `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` configure it.
+  - Both jobs end with a check that fails the release unless the signatures are valid and from
+    the expected signer.
+- Pull request builds are never signed.
 
 ## Other notes
 
