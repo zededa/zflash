@@ -144,9 +144,12 @@ jobs:
           # Remove the pending note from the release notes.
           python3 - <<'PY'
           import json, re
-          body = json.load(open("release.json")).get("body") or ""
-          body = re.sub(r"<!-- zflash-notarization-pending: .*?<!-- /zflash-notarization-pending -->\n*", "", body, flags=re.S)
-          json.dump({"body": body}, open("patch.json", "w"))
+          r = json.load(open("release.json"))
+          body = re.sub(r"<!-- zflash-notarization-pending: .*?<!-- /zflash-notarization-pending -->\n*", "", r.get("body") or "", flags=re.S)
+          # A draft keeps its tag name only if every edit sends it again;
+          # without it GitHub renames the draft's tag to "untagged-...".
+          json.dump({"body": body, "tag_name": r["tag_name"], "target_commitish": r["target_commitish"]}, open("patch.json", "w"))
           PY
-          gh api -X PATCH "repos/$repo/releases/$RELEASE_ID" --input patch.json >/dev/null
+          gh api -X PATCH "repos/$repo/releases/$RELEASE_ID" --input patch.json --jq .tag_name > tag_after
+          [ "$(cat tag_after)" = "$TAG" ] || { echo "::error::The release's tag is now $(cat tag_after), expected $TAG"; exit 1; }
           echo "::notice::The macOS DMG of $TAG is notarized and stapled. The release is still a draft: publish it when ready."
